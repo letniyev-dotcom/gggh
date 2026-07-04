@@ -5,6 +5,7 @@ import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.AnimationVector1D
 import androidx.compose.animation.core.Spring
+import androidx.compose.animation.core.animate
 import androidx.compose.animation.core.spring
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
@@ -42,6 +43,7 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.saveable.rememberSaveableStateHolder
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.State
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -149,7 +151,12 @@ fun AnketnicaApp(state: AnketnicaState) {
     val openAnketa: (Int) -> Unit = { detailId = it }
 
     // Single driver for both the sheet translation and the profile receding.
-    val sheetProgress = remember { Animatable(0f) }
+    // Using MutableState<Float> instead of Animatable so drag updates are fully
+    // synchronous — no coroutine launch per gesture frame, no mutex contention,
+    // position written in the SAME call-stack as the touch event so graphicsLayer
+    // always reads the current-frame value. The settle animation uses the
+    // standalone `animate()` function which drives the same state on each frame.
+    val sheetProgressState = remember { mutableStateOf(0f) }
     // Chrome: 1 on the home profile, 0 when a sub-screen covers it — lets the
     // sheet fade/slide away smoothly instead of popping in/out.
     val sheetChrome = remember { Animatable(1f) }
@@ -165,87 +172,84 @@ fun AnketnicaApp(state: AnketnicaState) {
     val travelPx = (rootHeightPx - peekPx - topGapPx).coerceAtLeast(1f)
     val measured = rootHeightPx > 0f
 
-    // Shared sheet-drive handlers: used by BOTH the sheet's own grabber AND a
-    // vertical-drag gesture on the profile behind it. Dragging up on the profile
-    // pulls «Новые анкеты» open; dragging down closes it — one continuous feel.
-    // A SINGLE tracked job serialises every mutation of sheetProgress. Without
-    // this, each drag event launched its own coroutine calling snapTo; on
-    // release, onDragEnd's animateTo raced with a still-queued stale snapTo that
-    // ran AFTER it through Animatable's mutator-mutex and cancelled the
-    // animation mid-flight — that was the "лист дёргается / улетает / пропадает"
-    // when flinging the sheet down. We cancel the previous mutation before every
-    // new one so only the latest ever wins.
-    var sheetDragJob by remember { mutableStateOf<Job?>(null) }
-    // TRUE while the release settle animation is running. The list's native fling
-    // keeps delivering momentum frames through nested-scroll AFTER the finger has
-    // lifted (and after onDragEnd already started the settle). Those trailing
-    // deltas used to call onDrag → cancel the settle mid-flight → the sheet
-    // "улетает / дрожит / пропадает". While settling we swallow every incoming
-    // drag delta so nothing can interrupt the settle. The settle is only ~340ms,
-    // so this is imperceptible for a deliberate re-grab.
+    // Settle job — only ONE running at a time. sheetSettling guards against the
+    // list's fling delivering Drag-source NSC deltas after the finger has lifted,
+    // which used to cancel the settle mid-flight. Genuine user gestures (grabber
+    // and profile pointerInput) call sheetOnGrabStart first, which cancels the
+    // settle and clears the flag so subsequent drag frames go straight through.
+    var sheetSettleJob by remember { mutableStateOf<Job?>(null) }
     var sheetSettling by remember { mutableStateOf(false) }
-    val sheetOnDrag: (Float) -> Unit = { dyPx ->
-        if (!sheetSettling) {
-            // Compute travel LIVE from rootHeightPx. The gesture handlers that
-            // call this — the grabber's pointerInput(Unit), the profile's
-            // pointerInput(Unit), and the list's nestedScroll remember(interactive)
-            // — all capture THIS lambda at first composition, when rootHeightPx
-            // was still 0 and a captured `travelPx` stayed pinned at its 1px floor
-            // forever. Dividing a drag delta by 1px flung sheetProgress across the
-            // whole 0..1 range on the tiniest finger move — exactly the
-            // "резко пропадает / появляется / взлетает / падает" chaos when
-            // dragging by the list (the grabber hid it because onDragEnd always
-            // settles to a clean 0/1). Reading rootHeightPx (a live snapshot
-            // state) here means even a stale-captured lambda uses the real,
-            // post-measure travel, so the drag tracks the finger 1:1 again.
-            val tp = (rootHeightPx - peekPx - topGapPx).coerceAtLeast(1f)
-            val next = (sheetProgress.value - dyPx / tp).coerceIn(0f, 1f)
-            sheetDragJob?.cancel()
-            sheetDragJob = scope.launch { sheetProgress.snapTo(next) }
-        }
-    }
-    // ONE serialised settle path shared by drag-release, the header tap-toggle
-    // AND the system back gesture. Previously onToggle/BackHandler launched a
-    // bare `animateTo` OUTSIDE the tracked-job mechanism, so a stale drag
-    // snapTo still queued on Animatable's mutator mutex could run AFTER it and
-    // cancel the animation mid-flight — the sheet froze halfway open/closed
-    // (the "панель выезжает и застревает" symptom). The `finally` also checks
-    // ownership before releasing the settling lock: a CANCELLED old settle
-    // used to clear the lock a newer settle had just taken, letting trailing
-    // fling deltas interrupt the new settle again.
-    val settleSheetTo: (Float) -> Unit = { target ->
-        sheetDragJob?.cancel()
+
+    // Settle: run spring animation via the standalone animate() function, which
+    // drives sheetProgressState on every frame without needing Animatable or a
+    // mutator-mutex. initialVelocity carries the finger's release speed so the
+    // spring continues from actual swipe momentum instead of always cold-starting.
+    val settleSheetTo: (Float, Float) -> Unit = { target, initialVelocity ->
+        sheetSettleJob?.cancel()
         sheetSettling = true
+        val startValue = sheetProgressState.value
         var job: Job? = null
         job = scope.launch {
             try {
-                sheetProgress.animateTo(target, SheetPositionSpec)
+                animate(
+                    initialValue = startValue,
+                    targetValue = target,
+                    initialVelocity = initialVelocity,
+                    animationSpec = SheetPositionSpec,
+                ) { value, _ -> sheetProgressState.value = value }
             } finally {
-                if (sheetDragJob === job) sheetSettling = false
+                if (sheetSettleJob === job) sheetSettling = false
             }
         }
-        sheetDragJob = job
+        sheetSettleJob = job
     }
+
+    // Drag — fully synchronous direct state write. No coroutine, no mutex.
+    // Compute travel LIVE from rootHeightPx (a snapshot state) so even a
+    // stale-captured lambda always divides by the real post-measure travel.
+    val sheetOnDrag: (Float) -> Unit = { dyPx ->
+        if (!sheetSettling) {
+            val tp = (rootHeightPx - peekPx - topGapPx).coerceAtLeast(1f)
+            sheetProgressState.value = (sheetProgressState.value - dyPx / tp).coerceIn(0f, 1f)
+        }
+    }
+
+    // Called at the START of a genuine user gesture (grabber / profile drag).
+    // Cancels any running settle immediately so the finger takes control with
+    // no delay — the sheet tracks 1:1 from the very first drag frame. The
+    // sheetSettling guard is intentionally kept for NestedScrollConnection
+    // Drag-source events (post-lift fling echoes from the list) so they cannot
+    // restart a cancelled settle.
+    val sheetOnGrabStart: () -> Unit = {
+        if (sheetSettling) {
+            sheetSettleJob?.cancel()
+            sheetSettling = false
+        }
+    }
+
     val sheetOnDragEnd: (Float) -> Unit = { vy ->
         val target = when {
             vy < -700f -> 1f
             vy > 700f -> 0f
-            else -> if (sheetProgress.value > 0.4f) 1f else 0f
+            else -> if (sheetProgressState.value > 0.4f) 1f else 0f
         }
-        settleSheetTo(target)
+        // Convert pixel/s velocity to 0-1 progress velocity and carry it into
+        // the spring so a fast fling settles with natural momentum.
+        val tp = (rootHeightPx - peekPx - topGapPx).coerceAtLeast(1f)
+        settleSheetTo(target, -vy / tp)
     }
+
     // Live handles for gesture blocks: pointerInput(Unit) captures its lambdas
     // at FIRST composition, when the window insets can still be 0 — captured
-    // peekPx/topGapPx then stayed stale forever (same class of bug as the old
-    // travelPx pinned at its 1px floor). Routing every call through
-    // rememberUpdatedState makes the gesture always invoke the LATEST
-    // composition's handler with fresh inset-derived values.
+    // peekPx/topGapPx then stayed stale forever. Routing every call through
+    // rememberUpdatedState makes the gesture always invoke the LATEST handler.
     val currentSheetOnDrag by rememberUpdatedState(sheetOnDrag)
     val currentSheetOnDragEnd by rememberUpdatedState(sheetOnDragEnd)
+    val currentSheetOnGrabStart by rememberUpdatedState(sheetOnGrabStart)
 
-    val sheetExpanded by remember { derivedStateOf { sheetProgress.value > 0.5f } }
+    val sheetExpanded by remember { derivedStateOf { sheetProgressState.value > 0.5f } }
     BackHandler(enabled = sheetExpanded && detailId == null && subStack.isEmpty()) {
-        settleSheetTo(0f)
+        settleSheetTo(0f, 0f)
     }
     val onHome = subStack.isEmpty()
     LaunchedEffect(onHome) {
@@ -263,7 +267,7 @@ fun AnketnicaApp(state: AnketnicaState) {
             Modifier
                 .fillMaxSize()
                 .graphicsLayer {
-                    val p = sheetProgress.value.coerceIn(0f, 1f)
+                    val p = sheetProgressState.value.coerceIn(0f, 1f)
                     val s = 1f - 0.06f * p
                     scaleX = s
                     scaleY = s
@@ -285,7 +289,7 @@ fun AnketnicaApp(state: AnketnicaState) {
                     Modifier.pointerInput(Unit) {
                         val vt = VelocityTracker()
                         detectVerticalDragGestures(
-                            onDragStart = { vt.resetTracking() },
+                            onDragStart = { vt.resetTracking(); currentSheetOnGrabStart() },
                             onDragEnd = { currentSheetOnDragEnd(vt.calculateVelocity().y) },
                             onDragCancel = { currentSheetOnDragEnd(0f) },
                             onVerticalDrag = { change, dy ->
@@ -362,7 +366,7 @@ fun AnketnicaApp(state: AnketnicaState) {
             Box(
                 Modifier
                     .fillMaxSize()
-                    .graphicsLayer { alpha = sheetProgress.value.coerceIn(0f, 1f) * 0.5f }
+                    .graphicsLayer { alpha = sheetProgressState.value.coerceIn(0f, 1f) * 0.5f }
                     .background(Color.Black),
             )
         }
@@ -370,7 +374,7 @@ fun AnketnicaApp(state: AnketnicaState) {
         // ── Bottom sheet — always mounted; fades/slides away behind sub-screens. ─────
         NewAnketySheet(
             state = state,
-            progress = sheetProgress,
+            progress = sheetProgressState,
             chrome = sheetChrome,
             travelPx = travelPx,
             topGapPx = topGapPx,
@@ -379,12 +383,12 @@ fun AnketnicaApp(state: AnketnicaState) {
             interactive = subStack.isEmpty(),
             onOpenAnketa = openAnketa,
             onToggle = {
-                // Route through the SAME serialised settle as drags — a bare
-                // animateTo here could be cancelled by a queued stale snapTo.
-                settleSheetTo(if (sheetProgress.value < 0.5f) 1f else 0f)
+                settleSheetTo(if (sheetProgressState.value < 0.5f) 1f else 0f, 0f)
             },
             onDrag = sheetOnDrag,
             onDragEnd = sheetOnDragEnd,
+            onDragStart = sheetOnGrabStart,
+            onRequestExpand = { settleSheetTo(1f, 0f) },
         )
 
         // ── Anketa detail — top-most overlay, slides in from the right. ───────
@@ -421,7 +425,7 @@ fun AnketnicaApp(state: AnketnicaState) {
 @Composable
 private fun NewAnketySheet(
     state: AnketnicaState,
-    progress: Animatable<Float, AnimationVector1D>,
+    progress: State<Float>,
     chrome: Animatable<Float, AnimationVector1D>,
     travelPx: Float,
     topGapPx: Float,
@@ -432,6 +436,8 @@ private fun NewAnketySheet(
     onToggle: () -> Unit,
     onDrag: (Float) -> Unit,
     onDragEnd: (Float) -> Unit,
+    onDragStart: () -> Unit,
+    onRequestExpand: () -> Unit,
 ) {
     val newItems = state.ankety.filter { it.status == AnketaStatus.NEW }.sortedBy { it.agox }
     val expanded by remember { derivedStateOf { progress.value > 0.5f } }
@@ -447,6 +453,8 @@ private fun NewAnketySheet(
     val currentOnDrag by rememberUpdatedState(onDrag)
     val currentOnDragEnd by rememberUpdatedState(onDragEnd)
     val currentOnToggle by rememberUpdatedState(onToggle)
+    val currentOnDragStart by rememberUpdatedState(onDragStart)
+    val currentOnRequestExpand by rememberUpdatedState(onRequestExpand)
 
     // Dimension parameters (travelPx, topGapPx, peekPx) are derived from
     // window-inset snapshot states in the parent and arrive here as plain Floats.
@@ -480,7 +488,7 @@ private fun NewAnketySheet(
             // If the row was tapped while the sheet was only PART-way up, pull
             // the sheet the rest of the way open too — otherwise only the
             // top-gap collapsed and the opened detail stayed parked mid-screen.
-            if (progress.value < 1f) launch { progress.animateTo(1f, SheetPositionSpec) }
+            if (progress.value < 1f) currentOnRequestExpand()
             sheetFull.animateTo(1f, SheetSpec)
         } else {
             // Closing: the detail has already pushed out to the right (via
@@ -562,7 +570,7 @@ private fun NewAnketySheet(
                     .pointerInput(Unit) {
                         val vt = VelocityTracker()
                         detectVerticalDragGestures(
-                            onDragStart = { vt.resetTracking() },
+                            onDragStart = { vt.resetTracking(); currentOnDragStart() },
                             onDragEnd = { currentOnDragEnd(vt.calculateVelocity().y) },
                             onDragCancel = { currentOnDragEnd(0f) },
                             onVerticalDrag = { change, dy ->

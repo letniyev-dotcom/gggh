@@ -100,12 +100,14 @@ private val PushSpec = tween<Float>(PushDurationMs, easing = PushEasing)
 private val OverlaySpring = spring<Float>(
     dampingRatio = Spring.DampingRatioNoBouncy,
     stiffness = 500f,
+    visibilityThreshold = 0.0005f,
 )
 
 // Snappier spring for the rollback-from-cancel direction.
 private val OverlayCancelSpring = spring<Float>(
     dampingRatio = Spring.DampingRatioNoBouncy,
     stiffness = 600f,
+    visibilityThreshold = 0.0005f,
 )
 
 // Width of the swipe-back "grab" zone measured from the left edge of the overlay.
@@ -239,6 +241,14 @@ fun RoundedSlideOverlay(
     val progress = parallaxProgress
     val currentOnDismissed by rememberUpdatedState(onDismissed)
 
+    // During swipe-back drag, finger position is written here synchronously on the
+    // main thread — no coroutine, no mutex. The incoming screen's graphicsLayer
+    // reads this first so it moves with the finger in the same frame. The Animatable
+    // is still kept in sync for OverlayHost via the regular scope.launch snapTo,
+    // but that 1-frame lag on the receding screen is invisible (it's behind the
+    // incoming one). Float.NaN means "not dragging — read from Animatable instead".
+    var dragProgress by remember { mutableStateOf(Float.NaN) }
+
     // Slide in from the right on first composition. animateIn=false means this
     // overlay was already on screen as an underlay (a child just popped off), so
     // it should appear at its final position without replaying the entry slide.
@@ -325,11 +335,14 @@ fun RoundedSlideOverlay(
 
                     val width = size.width.toFloat()
                     val initialDx = (drag.position.x - down.position.x).coerceAtLeast(0f)
-                    // awaitEachGesture is a restricted-suspension scope: Animatable.snapTo
-                    // isn't on its dispatch surface, so we launch it on the composable
-                    // scope. Track the latest finger progress synchronously here so the
-                    // release threshold reflects where the finger actually was on lift.
+                    // Finger position is written to dragProgress synchronously on the
+                    // main thread — no coroutine launch, no Animatable mutex — so the
+                    // incoming screen's graphicsLayer sees the update in the same frame
+                    // the pointer event arrives. The Animatable is also kept in sync
+                    // (via scope.launch snapTo) for OverlayHost, whose 1-frame lag is
+                    // invisible since it sits BEHIND the incoming screen.
                     var fingerProgress = (initialDx / width).coerceIn(0f, 1f)
+                    dragProgress = fingerProgress
                     scope.launch { progress.snapTo(fingerProgress) }
 
                     var released = false
@@ -343,10 +356,15 @@ fun RoundedSlideOverlay(
                             velocityTracker.addPosition(change.uptimeMillis, change.position)
                             change.consume()
                             fingerProgress = (dx / width).coerceIn(0f, 1f)
+                            dragProgress = fingerProgress
                             scope.launch { progress.snapTo(fingerProgress) }
                         }
                     }
 
+                    // Hand the graphicsLayer back to the Animatable before the spring
+                    // runs, so both this screen and OverlayHost animate from the same
+                    // shared driver again.
+                    dragProgress = Float.NaN
                     val velocity = velocityTracker.calculateVelocity().x
                     val shouldDismiss =
                         fingerProgress >= SwipeBackCommitFraction ||
@@ -379,9 +397,11 @@ fun RoundedSlideOverlay(
                 }
             }
             .graphicsLayer {
-                // Spring physics can briefly overshoot to negative values when the
-                // overlay settles back through zero — clamp before translating.
-                val p = progress.value.coerceAtLeast(0f)
+                // During drag: read dragProgress (written synchronously on the main
+                // thread, zero-latency). During animation: fall back to Animatable.
+                // Spring physics can briefly overshoot to negative values — clamp.
+                val raw = if (dragProgress.isNaN()) progress.value else dragProgress
+                val p = raw.coerceAtLeast(0f)
                 translationX = p * size.width
                 // Cover style: the leading (left) corners round up to the device
                 // curve as the screen moves out; right corners stay 0 (it's at or
