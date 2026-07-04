@@ -80,9 +80,13 @@ import kotlinx.coroutines.launch
 // damped spring (NO bounce) glides it in/out and settles organically, so it
 // reads as smooth, not slower. Same spec drives the profile receding, the
 // header tap-toggle, the back gesture and the drag-release settle.
+// stiffness = 380 → ~20 % faster than the old 260 while keeping the same
+// critically-damped (no-bounce) character. At 260 the sheet felt sluggish
+// near the top; 380 reaches 90 % of its target in ≈ 200 ms and feels
+// responsive without being sharp.
 private val SheetSpec = spring<Float>(
     dampingRatio = Spring.DampingRatioNoBouncy,
-    stiffness = 260f,
+    stiffness = 380f,
 )
 
 // Position-specific spec for sheetProgress (0–1 value that gets multiplied by
@@ -95,15 +99,13 @@ private val SheetSpec = spring<Float>(
 //
 // visibilityThreshold = 0.0005f → 0.05% of travel → ≈ 0.75 px on a 1500 px
 // screen — completely imperceptible. The spring physics (curve, feel, timing)
-// are identical; it just runs a fraction longer through the invisible tail
-// instead of snapping early.
+// are identical; it just runs through the invisible tail instead of snapping.
 //
 // SheetSpec is intentionally kept at the default threshold: sheetChrome and
-// sheetFull animate 0–1 alpha/scale values where 0.01 = invisible, so there
-// is no perceptible snap there.
+// sheetFull animate 0–1 alpha/scale values where 0.01 = invisible.
 private val SheetPositionSpec = spring<Float>(
     dampingRatio = Spring.DampingRatioNoBouncy,
-    stiffness = 260f,
+    stiffness = 380f,
     visibilityThreshold = 0.0005f,
 )
 
