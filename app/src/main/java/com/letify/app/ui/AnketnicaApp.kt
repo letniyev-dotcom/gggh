@@ -85,6 +85,28 @@ private val SheetSpec = spring<Float>(
     stiffness = 260f,
 )
 
+// Position-specific spec for sheetProgress (0–1 value that gets multiplied by
+// travelPx to produce translationY). The default spring visibilityThreshold is
+// 0.01f, which is "1% of total travel". With travelPx ≈ 1500 px that means
+// the spring terminates — and SNAPS to its target — while still 15 px away.
+// That single-frame teleport is the "тормозит вверху → резко поднимается"
+// the user sees: the spring decelerates naturally (correct), then at the
+// snap point jumps the remaining pixels in one frame (incorrect).
+//
+// visibilityThreshold = 0.0005f → 0.05% of travel → ≈ 0.75 px on a 1500 px
+// screen — completely imperceptible. The spring physics (curve, feel, timing)
+// are identical; it just runs a fraction longer through the invisible tail
+// instead of snapping early.
+//
+// SheetSpec is intentionally kept at the default threshold: sheetChrome and
+// sheetFull animate 0–1 alpha/scale values where 0.01 = invisible, so there
+// is no perceptible snap there.
+private val SheetPositionSpec = spring<Float>(
+    dampingRatio = Spring.DampingRatioNoBouncy,
+    stiffness = 260f,
+    visibilityThreshold = 0.0005f,
+)
+
 // The in-sheet push-in (RoundedSlideOverlay) takes ~360ms + 2 warm-up frames.
 // The sheet only climbs to fullscreen AFTER that, so opening an anketa reads as
 // two clean beats: (1) the detail slides in WITHIN the small resting sheet,
@@ -195,7 +217,7 @@ fun AnketnicaApp(state: AnketnicaState) {
         var job: Job? = null
         job = scope.launch {
             try {
-                sheetProgress.animateTo(target, SheetSpec)
+                sheetProgress.animateTo(target, SheetPositionSpec)
             } finally {
                 if (sheetDragJob === job) sheetSettling = false
             }
@@ -456,7 +478,7 @@ private fun NewAnketySheet(
             // If the row was tapped while the sheet was only PART-way up, pull
             // the sheet the rest of the way open too — otherwise only the
             // top-gap collapsed and the opened detail stayed parked mid-screen.
-            if (progress.value < 1f) launch { progress.animateTo(1f, SheetSpec) }
+            if (progress.value < 1f) launch { progress.animateTo(1f, SheetPositionSpec) }
             sheetFull.animateTo(1f, SheetSpec)
         } else {
             // Closing: the detail has already pushed out to the right (via
