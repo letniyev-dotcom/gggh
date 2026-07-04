@@ -1,0 +1,48 @@
+# ── Letify baseline profile (human-readable HRF) ─────────────────────────
+#
+# AGP compiles this into the release APK's baseline profile
+# (assets/dexopt/baseline.prof) and rewrites it through the R8 mapping
+# automatically, so it stays valid under minification.
+#
+# Goal: AOT-compile the app's own hot paths — startup, the screen-transition
+# machinery (overlay push/pop single-driver, tab AnimatedContent), the navbar
+# pill/blur, and the SVG icon prewarm — so the FIRST run of each transition
+# isn't interpreted/JIT'd mid-slide. The Compose libraries (runtime, ui,
+# foundation, animation, material3) already ship their OWN baseline profiles,
+# so the gap we close here is the app code + the two unprofiled deps
+# (haze, coil) that draw every frame of a transition.
+#
+# Flags: H = hot, S = startup, P = post-startup.
+
+# ── Whole app: classes + all methods, hot/startup/post-startup ─────────────
+HSPLcom/letify/app/**->**(**)**
+Lcom/letify/app/**;
+
+# ── Startup-critical entry points (explicit, so they're in the startup set) ─
+HSPLcom/letify/app/MainActivity;->**(**)**
+HSPLcom/letify/app/ui/icons/SolarIconLoader;->**(**)**
+HSPLcom/letify/app/ui/icons/SolarIconLoader$**;->**(**)**
+
+# ── Transition hot path: overlay push/pop + tab switch + navbar ────────────
+HSPLcom/letify/app/ui/components/LetifyOverlayKt;->**(**)**
+HSPLcom/letify/app/ui/components/OverlayScreenKt;->**(**)**
+HSPLcom/letify/app/ui/components/NavbarKt;->**(**)**
+HSPLcom/letify/app/ui/LetifyAppKt;->**(**)**
+
+# ── haze (frosted-glass navbar blur — drawn every frame of a slide) ────────
+HSPLdev/chrisbanes/haze/**->**(**)**
+Ldev/chrisbanes/haze/**;
+
+# ── Coil (SVG icon decode + AsyncImage, exercised during prewarm/first run) ─
+HSPLcoil/**->**(**)**
+Lcoil/**;
+HSPLcoil/compose/**->**(**)**
+Lcoil/compose/**;
+
+# ── A focused slice of Compose animation/transition runtime, in case the
+#    library-bundled profile misses our exact call shapes. Redundant-safe. ──
+HSPLandroidx/compose/animation/core/**->**(**)**
+HSPLandroidx/compose/animation/AnimatedContentKt;->**(**)**
+HSPLandroidx/compose/animation/EnterExitTransitionKt;->**(**)**
+HSPLandroidx/compose/ui/graphics/GraphicsLayerScope;->**(**)**
+HSPLandroidx/compose/ui/graphics/SimpleGraphicsLayerModifier;->**(**)**
